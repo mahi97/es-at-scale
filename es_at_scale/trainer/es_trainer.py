@@ -60,8 +60,12 @@ class EvolutionStrategiesTrainer:
         save_best_models=True,# If True, save a checkpoint whenever a new best eval score is achieved, final model is always saved to disk upon training completion
         experiment_name=None, # Human-readable run name used in W&B and checkpoint paths; auto-generated if None
         wandb_project=None,   # W&B project to log to; only used when logging="wandb"
-        reward_function_timeout=60  # Seconds before a reward function call is killed and assigned 0.0
-
+        reward_function_timeout=60,  # Seconds before a reward function call is killed and assigned 0.0
+        es_options=None,      # dict passed to WorkerExtension.configure_es (IFS-ES fork options); None = upstream behaviour
+        gpu_memory_utilization=0.7,
+        save_every=0,         # save engine-0 weights every this many iterations (0 = never) to ckpt_dir
+        ckpt_dir=None,
+        history_json=None,    # write per-iteration train/eval metrics to this JSON file
     ):
         # GPU init
         os.environ["CUDA_VISIBLE_DEVICES"] = use_gpus
@@ -99,6 +103,12 @@ class EvolutionStrategiesTrainer:
 
         self.experiment_name = experiment_name
         self.wandb_project = wandb_project
+        self.es_options = es_options
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.save_every = save_every
+        self.ckpt_dir = ckpt_dir
+        self.history_json = history_json
+        self.history = dict(train=[], eval=[], es_info=None)
 
         self.n_samples = 1
         self.rollout_reduce = "mean"
@@ -142,8 +152,11 @@ class EvolutionStrategiesTrainer:
 
             self.wandb_run = self.wandb.init(
                 project=self.wandb_project,
-                group=wandb_group,
+                group=os.environ.get("WANDB_RUN_GROUP", wandb_group),
                 name=self.experiment_name,
+                config=dict(sigma=sigma, alpha=alpha, population_size=population_size, model=model_name,
+                            batch_size=batch_size, max_tokens=max_tokens, seed=global_seed,
+                            es_options=es_options or {}),
                 dir=self.logging_dir,
                 mode=os.environ.get("WANDB_MODE", "online"),
                 settings=self.wandb.Settings(start_method="thread"),
@@ -177,6 +190,13 @@ class EvolutionStrategiesTrainer:
                 for i in range(self.n_vllm_engines)
             ]
         )
+        if self.es_options:
+            infos = ray.get([e.collective_rpc.remote("configure_es", args=(self.es_options,)) for e in self.engines])
+            info = infos[0][0] if isinstance(infos[0], list) else infos[0]
+            self.history["es_info"] = info
+            print("[IFS] configure_es:", info)
+            if self.logging == "wandb":
+                self.wandb.config.update({"es_info": info}, allow_val_change=True)
         if self.checkpoint is not None:
             print("Loading checkpoint weights")
             ray.get(
@@ -250,7 +270,7 @@ class EvolutionStrategiesTrainer:
                 dtype=precision,
                 enable_prefix_caching=False,
                 enforce_eager=False,
-                gpu_memory_utilization=0.7,
+                gpu_memory_utilization=self.gpu_memory_utilization,
             )
             for strategy in strategies
         ]
@@ -420,6 +440,9 @@ class EvolutionStrategiesTrainer:
             }
             self.wandb.log(payload, commit=True)
 
+        self.history["train"].append(dict(iteration=iteration, reward_mean=mean_reward, reward_std=std_reward,
+                                          reward_min=min_reward, reward_max=max_reward, length_mean=mean_length,
+                                          member_rewards=all_avg_rewards))
         seeds_perf = z_score(seeds_perf, std_reward=std_reward, mean_reward=mean_reward)
 
         coeffs = [
@@ -543,6 +566,15 @@ class EvolutionStrategiesTrainer:
 
             dataset_results = (sum_reward / count) if count else 0.0
             mean_eval_results.append(dataset_results)
+            acc = float(np.mean([r["format"]["answer_reward"] for r in save_results
+                                 if isinstance(r.get("format"), dict)])) if save_results else 0.0
+            fmt_ok = float(np.mean([r["format"]["format_reward"] == 1.0 for r in save_results
+                                    if isinstance(r.get("format"), dict)])) if save_results else 0.0
+            self.history["eval"].append(dict(iteration=iteration, task=name, pass1_shaped=dataset_results,
+                                             accuracy=acc, format_full=fmt_ok,
+                                             length_mean=float(np.mean([r["response_length"] for r in save_results]))
+                                             if save_results else 0.0))
+            to_log.update({f"eval/{name}/accuracy": acc, f"eval/{name}/format_full": fmt_ok})
 
             print(
                 f"{name} -- eval pass@1: {dataset_results} --"
@@ -619,6 +651,14 @@ class EvolutionStrategiesTrainer:
 
                 if ((iteration + 1) % self.eval_freq) == 0 and (iteration > 0):
                     self.eval_step(iteration=iteration)
+
+                if self.save_every and self.ckpt_dir and (iteration + 1) % self.save_every == 0:
+                    os.makedirs(self.ckpt_dir, exist_ok=True)
+                    ray.get(self.engines[0].collective_rpc.remote(
+                        "save_self_weights_to_disk", args=(f"{self.ckpt_dir}/iter{iteration + 1}.pth",)))
+                self.history["train"][-1]["sec"] = time.time() - total_iter_start
+                if self.history_json:
+                    json.dump(self.history, open(self.history_json, "w"))
 
                 total_iter_end = time.time()
                 print(

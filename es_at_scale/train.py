@@ -80,6 +80,20 @@ def main():
     parser.add_argument("--experiment-name", type=str, default=None,
                         help="Experiment name for logging and checkpoints. Auto-generated from hyperparams if not set.")
     parser.add_argument("--wandb-project", type=str, default="es-finetuning")
+    # IFS-ES fork options (defaults = upstream behaviour)
+    parser.add_argument("--noise-iid", action="store_true", help="seed each tensor with seed + tensor index")
+    parser.add_argument("--exact-restore", action="store_true", help="restore perturbed weights by copy")
+    parser.add_argument("--fp32-master", action="store_true", help="fp32 master weights on engine 0 for the update")
+    parser.add_argument("--precond-mode", type=str, default="none", choices=["none", "sample", "placeB"])
+    parser.add_argument("--precond-path", type=str, default=None, help="K-FAC factors from es_at_scale.kfac.compute_fisher")
+    parser.add_argument("--precond-q", type=float, default=-0.5,
+                        help="eps cov = c (F + lam I)^(2q): -0.5 -> F^-1, -0.25 -> F^-1/2, +0.5 -> F^+1")
+    parser.add_argument("--precond-gamma", type=float, default=1e-2, help="lam = gamma * mean eigenvalue of F")
+    parser.add_argument("--precond-norm", type=str, default="kl", choices=["kl", "euclid"])
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
+    parser.add_argument("--save-every", type=int, default=0)
+    parser.add_argument("--ckpt-dir", type=str, default=None)
+    parser.add_argument("--history-json", type=str, default=None)
 
     args = parser.parse_args()
     print(args)
@@ -164,9 +178,15 @@ def main():
         wandb_project=args.wandb_project,
         save_best_models=args.save_best_models,
         reward_function_timeout=args.reward_function_timeout,
-        output_directory=args.output_directory
-        
-
+        output_directory=args.output_directory,
+        es_options=dict(noise_iid=args.noise_iid, exact_restore=args.exact_restore, fp32_master=args.fp32_master,
+                        precond_mode=args.precond_mode, precond_path=args.precond_path, precond_q=args.precond_q,
+                        precond_gamma=args.precond_gamma, precond_norm=args.precond_norm, quiet=True)
+        if (args.noise_iid or args.exact_restore or args.fp32_master or args.precond_mode != "none") else None,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        save_every=args.save_every,
+        ckpt_dir=args.ckpt_dir,
+        history_json=args.history_json,
     )
 
     trainer.fit()

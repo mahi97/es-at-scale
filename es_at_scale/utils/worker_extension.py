@@ -45,7 +45,62 @@ class WorkerExtension:
         print("Initial weights saved.")
 
 
+    # ------------------------------------------------------------------------------------------------------------
+    # IFS-ES options (inverse-metric-es fork). Defaults reproduce the upstream behaviour exactly.
+    #   noise_iid      : seed each parameter tensor with seed + tensor index (upstream reuses one seed for all tensors)
+    #   exact_restore  : restore = copy of the pre-perturbation weights (upstream subtracts the noise again in bf16)
+    #   fp32_master    : engine 0 keeps fp32 master weights; updates are accumulated there (upstream adds in bf16)
+    #   precond_mode   : 'none' | 'sample' (eps ~ N(0, c (F+lam I)^{2q}), placement A) | 'placeB' (isotropic eps,
+    #                    estimate preconditioned by the same matrix); see es_at_scale/utils/kfac_precond.py
+    # ------------------------------------------------------------------------------------------------------------
+    def configure_es(self, opts):
+        self.es_opts = dict(opts)
+        self._base, self._master, self._fac, self._S = None, None, None, None
+        info = {}
+        mode = self.es_opts.get("precond_mode", "none")
+        if mode != "none":
+            from es_at_scale.utils.kfac_precond import load_factors, make_scales
+            dev = next(self.model_runner.model.parameters()).device
+            fac, meta = load_factors(self.es_opts["precond_path"], dev, torch.float32)
+            names = {n for n, _ in self.model_runner.model.named_parameters()}
+            missing = [n for n in fac if n not in names]
+            assert not missing, ("factor names not found in vLLM model", missing[:5])
+            shapes = {n: tuple(p.shape) for n, p in self.model_runner.model.named_parameters()}
+            for n, d in fac.items():
+                want = (sum(l.numel() for l in d["lG"]), sum(l.numel() for l in d["lA"]))
+                assert shapes[n] == want, (n, shapes[n], want)
+            self._S, info = make_scales(fac, float(self.es_opts["precond_q"]), float(self.es_opts["precond_gamma"]),
+                                        self.es_opts.get("precond_norm", "kl"))
+            self._fac = fac
+            info["n_kfac_weights"] = len(fac)
+            info["factor_meta"] = {k: v for k, v in meta.items() if isinstance(v, (int, float, str))}
+        if self.es_opts.get("exact_restore"):
+            self._base = {n: p.detach().clone() for n, p in self.model_runner.model.named_parameters()}
+        torch.cuda.empty_cache()
+        return info
+
+    def _opt(self, key, default=None):
+        return getattr(self, "es_opts", {}).get(key, default)
+
+    def _draw(self, idx, p, seed):
+        gen = torch.Generator(device=p.device)
+        gen.manual_seed(int(seed) + (idx if self._opt("noise_iid") else 0))
+        return torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
+
+    def _eps(self, idx, name, p, seed):
+        """Perturbation direction for one tensor (p.dtype), shaped by K-FAC in 'sample' mode."""
+        z = self._draw(idx, p, seed)
+        if self._opt("precond_mode", "none") == "sample" and name in self._fac:
+            from es_at_scale.utils.kfac_precond import sample_transform
+            return sample_transform(self._fac[name], self._S[name], z.float()).to(p.dtype)
+        return z
+
     def restore_self_weights(self, seed, sigma):
+        if self._opt("exact_restore"):
+            for name, p in self.model_runner.model.named_parameters():
+                p.data.copy_(self._base[name])
+            torch.cuda.synchronize()
+            return True
         self._set_seed(seed)
         for _, p in self.model_runner.model.named_parameters():
             gen = torch.Generator(device=p.device)
@@ -95,42 +150,32 @@ class WorkerExtension:
         return True
 
     def update_weights_from_seeds(self, seeds, coeffs, alpha, population_size):
-        """
-        Mimics the Original implementation's update loop structure:
-        Iterate Param -> Iterate Seeds -> Accumulate -> Single Update.
-        """
-        # seeds and coeffs should be lists of equal length
-        # coeffs[i] should be: (alpha / population_size) * normalized_reward
-
-        for _, p in self.model_runner.model.named_parameters():
-            # float32
+        """theta += alpha/N * sum_n coeff_n eps_n. In 'sample' mode eps_n = T(z_n) with T linear, so the sum is
+        T(sum_n coeff_n z_n): one transform per tensor. In 'placeB' mode the isotropic estimate is preconditioned."""
+        mode = self._opt("precond_mode", "none")
+        fac, S = getattr(self, "_fac", None), getattr(self, "_S", None)
+        if self._opt("fp32_master") and getattr(self, "_master", None) is None:
+            self._master = {n: p.detach().float().clone() for n, p in self.model_runner.model.named_parameters()}
+        master = getattr(self, "_master", None)
+        for idx, (name, p) in enumerate(self.model_runner.model.named_parameters()):
             update_accumulator = torch.zeros_like(p.data, dtype=torch.float32)
-
-            for i, (seed) in enumerate(seeds):
-                gen = torch.Generator(device=p.device)
-                gen.manual_seed(int(seed))
-
-                # Generate noise (in native precision, usually float16/bfloat16)
-                noise = torch.randn(
-                    p.shape, dtype=p.dtype, device=p.device, generator=gen
-                )
-
-                # FIXED: Convert noise to float32 BEFORE multiplication.
-                # Previous code: noise.to(torch.float16) * coeffs[i]
-                # This caused the tiny update signal (1e-5) to be truncated by FP16 precision limits.
-                term = noise.to(torch.float32) * coeffs[i]
-
-                # Accumulate in FP32
-                update_accumulator.add_(term)
-
-            # multiply with scale (alpha/population_size) once at the end to preserve precision
-            scale = float(alpha) / float(population_size)
-            update_accumulator.mul_(scale)
-            # Apply final update to weight (cast back to model dtype at the very end)
-            p.data.add_(update_accumulator.to(p.dtype))
-
+            for i, seed in enumerate(seeds):
+                noise = self._draw(idx, p, seed)
+                update_accumulator.add_(noise.to(torch.float32) * coeffs[i])
+                del noise
+            if fac is not None and name in fac:
+                from es_at_scale.utils.kfac_precond import sample_transform, precond_transform
+                if mode == "sample":
+                    update_accumulator = sample_transform(fac[name], S[name], update_accumulator)
+                elif mode == "placeB":
+                    update_accumulator = precond_transform(fac[name], S[name], update_accumulator)
+            update_accumulator.mul_(float(alpha) / float(population_size))
+            if master is not None:
+                master[name].add_(update_accumulator)
+                p.data.copy_(master[name].to(p.dtype))
+            else:
+                p.data.add_(update_accumulator.to(p.dtype))
             del update_accumulator
-
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -148,17 +193,19 @@ class WorkerExtension:
         scale = float(noise_scale)
         sign = -1.0 if negate else 1.0
 
-        for _, p in self.model_runner.model.named_parameters():
-            gen = torch.Generator(device=p.device)
-            gen.manual_seed(int(seed))
-            noise = torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
+        exact = self._opt("exact_restore")
+        for idx, (name, p) in enumerate(self.model_runner.model.named_parameters()):
+            if exact:
+                self._base[name].copy_(p.data)
+            noise = self._eps(idx, name, p, seed)
             p.data.add_(sign * scale * noise)
             del noise
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        print(f"Weights changed with: sign={sign}; scale={sign * scale}.")
+        if not self._opt("quiet"):
+            print(f"Weights changed with: sign={sign}; scale={sign * scale}.")
 
     def save_self_weights_to_disk(self, filepath):
         """Save the current model weights to disk."""
