@@ -101,3 +101,25 @@ def precond_transform(d, s_rows, U):
             c0 += as_[bj]
         r0 += gs[bi]
     return out
+
+
+# ---- diagonal ablation (3PO / HiZOO-style structure): Sigma = c (diag(F) + lam)^{2q} on the same weights ----
+def load_diag(path, names, device):
+    blob = torch.load(path, map_location='cpu', weights_only=False)
+    return {n: blob['diag'][n].to(device=device, dtype=torch.float32) for n in names}
+
+
+def make_diag_scales(diag, q, gamma, norm):
+    tot_f = sum(float(d.sum()) for d in diag.values())
+    tot_n = sum(d.numel() for d in diag.values())
+    lam = gamma * tot_f / tot_n
+    S, den_e, den_k = {}, 0.0, 0.0
+    for n, f in diag.items():
+        s = (f.clamp_min(0) + lam) ** q
+        den_e += float((s * s).sum()); den_k += float((f * s * s).sum())
+        S[n] = s
+    c = tot_n / den_e if norm == 'euclid' else tot_f / den_k
+    for n in S:
+        S[n] = S[n] * c ** 0.5
+    return S, dict(lam=lam, c=c, kl_budget_rel_iso=c * den_k / tot_f, euclid_budget_rel_iso=c * den_e / tot_n,
+                   q=q, gamma=gamma, norm=norm, mean_f=tot_f / tot_n)

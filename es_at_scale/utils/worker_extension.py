@@ -72,6 +72,24 @@ class WorkerExtension:
             self._S, info = make_scales(fac, float(self.es_opts["precond_q"]), float(self.es_opts["precond_gamma"]),
                                         self.es_opts.get("precond_norm", "kl"))
             self._fac = fac
+            cm = float(self.es_opts.get("precond_c_mult", 1.0))
+            if cm != 1.0:        # measured-KL calibration: scale the covariance by cm (eps by sqrt(cm))
+                for rows in self._S.values():
+                    for row in rows:
+                        for j in range(len(row)):
+                            row[j] = row[j] * cm ** 0.5
+                info["c_mult"] = cm
+            if mode == "diag":   # diagonal-Fisher ablation on the same weights (K-FAC factors only define the set)
+                from es_at_scale.utils.kfac_precond import load_diag, make_diag_scales
+                diag = load_diag(self.es_opts["precond_diag_path"], list(fac), dev)
+                self._S, info = make_diag_scales(diag, float(self.es_opts["precond_q"]),
+                                                 float(self.es_opts["precond_gamma"]), self.es_opts.get("precond_norm", "kl"))
+                if cm != 1.0:
+                    for n in self._S:
+                        self._S[n] = self._S[n] * cm ** 0.5
+                    info["c_mult"] = cm
+                self._fac = {n: None for n in fac}
+                del diag
             info["n_kfac_weights"] = len(fac)
             info["factor_meta"] = {k: v for k, v in meta.items() if isinstance(v, (int, float, str))}
         if self.es_opts.get("exact_restore"):
@@ -90,9 +108,12 @@ class WorkerExtension:
     def _eps(self, idx, name, p, seed):
         """Perturbation direction for one tensor (p.dtype), shaped by K-FAC in 'sample' mode."""
         z = self._draw(idx, p, seed)
-        if self._opt("precond_mode", "none") == "sample" and name in self._fac:
+        mode = self._opt("precond_mode", "none")
+        if mode == "sample" and name in self._fac:
             from es_at_scale.utils.kfac_precond import sample_transform
             return sample_transform(self._fac[name], self._S[name], z.float()).to(p.dtype)
+        if mode == "diag" and name in self._fac:
+            return (z.float() * self._S[name]).to(p.dtype)
         return z
 
     def restore_self_weights(self, seed, sigma):
@@ -167,6 +188,8 @@ class WorkerExtension:
                 from es_at_scale.utils.kfac_precond import sample_transform, precond_transform
                 if mode == "sample":
                     update_accumulator = sample_transform(fac[name], S[name], update_accumulator)
+                elif mode == "diag":
+                    update_accumulator = update_accumulator * S[name]
                 elif mode == "placeB":
                     update_accumulator = precond_transform(fac[name], S[name], update_accumulator)
             update_accumulator.mul_(float(alpha) / float(population_size))

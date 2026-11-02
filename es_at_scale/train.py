@@ -84,7 +84,10 @@ def main():
     parser.add_argument("--noise-iid", action="store_true", help="seed each tensor with seed + tensor index")
     parser.add_argument("--exact-restore", action="store_true", help="restore perturbed weights by copy")
     parser.add_argument("--fp32-master", action="store_true", help="fp32 master weights on engine 0 for the update")
-    parser.add_argument("--precond-mode", type=str, default="none", choices=["none", "sample", "placeB"])
+    parser.add_argument("--precond-mode", type=str, default="none", choices=["none", "sample", "placeB", "diag"])
+    parser.add_argument("--precond-c-mult", type=float, default=1.0,
+                        help="multiply the covariance by this (measured-KL calibration, llm/ifs/analyze.py budget)")
+    parser.add_argument("--precond-diag-path", type=str, default=None, help="diagonal Fisher (compute_fisher *_diag.pt)")
     parser.add_argument("--precond-path", type=str, default=None, help="K-FAC factors from es_at_scale.kfac.compute_fisher")
     parser.add_argument("--precond-q", type=float, default=-0.5,
                         help="eps cov = c (F + lam I)^(2q): -0.5 -> F^-1, -0.25 -> F^-1/2, +0.5 -> F^+1")
@@ -181,7 +184,9 @@ def main():
         output_directory=args.output_directory,
         es_options=dict(noise_iid=args.noise_iid, exact_restore=args.exact_restore, fp32_master=args.fp32_master,
                         precond_mode=args.precond_mode, precond_path=args.precond_path, precond_q=args.precond_q,
-                        precond_gamma=args.precond_gamma, precond_norm=args.precond_norm, quiet=True)
+                        precond_gamma=args.precond_gamma, precond_norm=args.precond_norm,
+                        precond_diag_path=args.precond_diag_path,
+                        precond_c_mult=args.precond_c_mult, quiet=True)
         if (args.noise_iid or args.exact_restore or args.fp32_master or args.precond_mode != "none") else None,
         gpu_memory_utilization=args.gpu_memory_utilization,
         save_every=args.save_every,
