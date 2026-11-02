@@ -159,7 +159,6 @@ class EvolutionStrategiesTrainer:
                             es_options=es_options or {}),
                 dir=self.logging_dir,
                 mode=os.environ.get("WANDB_MODE", "online"),
-                settings=self.wandb.Settings(start_method="thread"),
             )
 
             self.wandb.define_metric("global_step")
